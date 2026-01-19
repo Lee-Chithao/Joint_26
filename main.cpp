@@ -1,46 +1,21 @@
 /**
- * Joint_CM_2026 v2 — ESP32-CAM (AI Thinker / OV2640) Web UI
+ * Joint_CM_2026 v2.1 — ESP32-CAM Optimized for Performance
  * 
- * ITERATION 2 FEATURES:
- * - Physical button interaction:
- *   • Single click: Capture photo
- *   • Long press (hold): Start video recording, release to stop
- * - SD Card storage for button-triggered captures
- * - Web UI download capability for photos and videos
- * - BreadVolt powered (single layer ESP32-CAM)
- *
- * Original Features (preserved):
- * - Dual Wi-Fi (WPA2-Enterprise + PSK fallback)
- * - Web UI with Photo/Video modes, Flash control
- * - Circular preview window, rotated 180°
- * - Gallery stored in page memory
- * - Terminal panel (SSE) with rich logs
- *
- * HARDWARE CONNECTIONS:
- * - Button: GPIO13 to GND (internal pull-up used)
- *   Note: GPIO13 is safe to use on ESP32-CAM (directly accessible)
- * - SD Card: Built-in (uses GPIO12, 13, 14, 15, 2)
- *   IMPORTANT: Since we're using GPIO13 for button, we need GPIO12 or another free pin
- *   REVISED: Button on GPIO12 (safe when SD not actively writing)
- *   OR use GPIO16 if available on your board variant
+ * OPTIMIZATIONS IN THIS VERSION:
+ * - Dual resolution mode (QVGA stream, VGA capture)
+ * - CAMERA_GRAB_LATEST for fresh frames
+ * - Triple buffering with PSRAM
+ * - Adaptive frame timing (targets 20fps)
+ * - Reduced capture latency
+ * - Sensor-level image optimizations
+ * - Improved WiFi task priority
  * 
- * BUTTON PIN OPTIONS (choose based on your wiring):
- * - GPIO12: Works but shared with SD card (avoid during SD writes)
- * - GPIO13: Works but shared with SD card  
- * - GPIO16: Best choice if your board exposes it (not all do)
- * - GPIO33: Built-in red LED pin (can be repurposed)
- *
- * Endpoints:
- *   GET  /              UI
- *   GET  /capture       JPEG (web capture)
- *   GET  /stream        MJPEG
- *   GET  /flash?on=1|0  flash control
- *   GET  /events        SSE terminal
- *   GET  /log/clear     clear log buffer
- *   GET  /sd/list       list SD card files (JSON)
- *   GET  /sd/download?file=<name>  download file from SD
- *   GET  /sd/delete?file=<name>    delete file from SD
- *   GET  /sd/status     SD card status
+ * FEATURES:
+ * - Physical button: click=photo, hold=video
+ * - SD card storage for button captures
+ * - Web UI with download capability
+ * - Dual WiFi (Enterprise + PSK)
+ * - SSE terminal with logs
  */
 
 #include <Arduino.h>
@@ -60,35 +35,43 @@ extern "C" {
 // Forward declarations
 static void sse_send_line(httpd_req_t *req, const char* s);
 static void sse_send_recent(httpd_req_t *req, int max_lines);
+static void set_stream_mode();
+static void set_capture_mode();
 
 // ============================ CONFIG ============================
 
-// -------- Home Wi-Fi (PSK) --------
+// WiFi credentials
 static const char* WIFI_PSK_SSID = "VM2049066";
 static const char* WIFI_PSK_PASS = "mccxsaZddeda84ua";
 
-// -------- Uni Wi-Fi (WPA2-Enterprise) --------
 static const char* WIFI_ENT_SSID  = "UAL-WiFi";
 static const char* WIFI_ENT_USER  = "21005976";
 static const char* WIFI_ENT_PASS  = "#35L79Z57vb";
 static const char* WIFI_ENT_IDENT = "";
 
-// UI name
-static const char* DEVICE_NAME = "Joint_CM_2026 v2";
+static const char* DEVICE_NAME = "Joint_CM_2026 v2.1";
 
-// Flash LED pin (AI Thinker)
+// Hardware pins
 static const int FLASH_LED_PIN = 4;
+static const int BUTTON_PIN = 12;
 
-// -------- BUTTON CONFIG --------
-// GPIO for physical button (choose based on your wiring)
-// Option 1: GPIO12 - available but shared with SD (careful timing)
-// Option 2: GPIO16 - if your board exposes it
-// Option 3: GPIO33 - red LED pin, can repurpose
-static const int BUTTON_PIN = 12;  // Change this based on your wiring
-
-// Button timing thresholds (milliseconds)
+// Button timing
 static const uint32_t DEBOUNCE_MS = 50;
-static const uint32_t LONG_PRESS_MS = 800;  // Hold > 800ms = video recording
+static const uint32_t LONG_PRESS_MS = 800;
+
+// ============================ PERFORMANCE CONFIG ============================
+
+// Resolution presets (balance quality vs speed)
+#define STREAM_FRAMESIZE  FRAMESIZE_QVGA   // 320x240 - fast streaming
+#define CAPTURE_FRAMESIZE FRAMESIZE_VGA    // 640x480 - quality photos
+
+// JPEG quality (4-63, lower = better quality but slower)
+#define STREAM_QUALITY  12   // Fast streaming
+#define CAPTURE_QUALITY 8    // High quality photos
+
+// Target frame rate
+#define TARGET_STREAM_FPS 20
+#define MIN_FRAME_TIME_MS (1000 / TARGET_STREAM_FPS)
 
 // ============================ CAMERA PINS (AI Thinker) ============================
 #define PWDN_GPIO_NUM     32
@@ -108,7 +91,7 @@ static const uint32_t LONG_PRESS_MS = 800;  // Hold > 800ms = video recording
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ============================ LOG BUFFER (SSE terminal) ============================
+// ============================ LOG BUFFER ============================
 static const int LOG_CAP = 320;
 static const int LOG_LEN = 220;
 
@@ -141,7 +124,7 @@ static bool g_sd_available = false;
 static uint32_t g_photo_counter = 0;
 static uint32_t g_video_counter = 0;
 
-// ------------------ helpers ------------------
+// ============================ HELPERS ============================
 static bool has_text(const char* s) { return s && s[0] != '\0'; }
 
 static const char* reset_reason_str(esp_reset_reason_t r) {
@@ -192,9 +175,7 @@ static void set_flash(bool on) {
 // ============================ SD CARD FUNCTIONS ============================
 
 static bool init_sd_card() {
-  // SD_MMC uses 1-bit mode on ESP32-CAM
-  // This frees up some pins but is slower
-  if (!SD_MMC.begin("/sdcard", true)) {  // true = 1-bit mode
+  if (!SD_MMC.begin("/sdcard", true)) {
     log_pushf("[sd] mount failed");
     return false;
   }
@@ -213,28 +194,18 @@ static bool init_sd_card() {
   }
   
   uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-  uint64_t usedSpace = SD_MMC.usedBytes() / (1024 * 1024);
+  log_pushf("[sd] type=%s size=%lluMB", typeStr, cardSize);
   
-  log_pushf("[sd] card type=%s size=%lluMB used=%lluMB", typeStr, cardSize, usedSpace);
+  if (!SD_MMC.exists("/photos")) SD_MMC.mkdir("/photos");
+  if (!SD_MMC.exists("/videos")) SD_MMC.mkdir("/videos");
   
-  // Create directories if they don't exist
-  if (!SD_MMC.exists("/photos")) {
-    SD_MMC.mkdir("/photos");
-    log_pushf("[sd] created /photos directory");
-  }
-  if (!SD_MMC.exists("/videos")) {
-    SD_MMC.mkdir("/videos");
-    log_pushf("[sd] created /videos directory");
-  }
-  
-  // Find highest existing file numbers to continue sequence
+  // Find highest existing file numbers
   File root = SD_MMC.open("/photos");
   if (root) {
     File file = root.openNextFile();
     while (file) {
-      const char* name = file.name();
       uint32_t num = 0;
-      if (sscanf(name, "IMG_%u.jpg", &num) == 1) {
+      if (sscanf(file.name(), "IMG_%u.jpg", &num) == 1) {
         if (num >= g_photo_counter) g_photo_counter = num + 1;
       }
       file = root.openNextFile();
@@ -246,9 +217,8 @@ static bool init_sd_card() {
   if (root) {
     File file = root.openNextFile();
     while (file) {
-      const char* name = file.name();
       uint32_t num = 0;
-      if (sscanf(name, "VID_%u.mjpeg", &num) == 1) {
+      if (sscanf(file.name(), "VID_%u.mjpeg", &num) == 1) {
         if (num >= g_video_counter) g_video_counter = num + 1;
       }
       file = root.openNextFile();
@@ -256,8 +226,7 @@ static bool init_sd_card() {
     root.close();
   }
   
-  log_pushf("[sd] next photo=%u next video=%u", g_photo_counter, g_video_counter);
-  
+  log_pushf("[sd] next: photo=%u video=%u", g_photo_counter, g_video_counter);
   return true;
 }
 
@@ -268,7 +237,7 @@ static bool save_photo_to_sd(camera_fb_t* fb, char* out_filename, size_t out_len
   
   File file = SD_MMC.open(out_filename, FILE_WRITE);
   if (!file) {
-    log_pushf("[sd] failed to create %s", out_filename);
+    log_pushf("[sd] create failed: %s", out_filename);
     return false;
   }
   
@@ -276,11 +245,10 @@ static bool save_photo_to_sd(camera_fb_t* fb, char* out_filename, size_t out_len
   file.close();
   
   if (written != fb->len) {
-    log_pushf("[sd] write error: %u/%u bytes", written, fb->len);
+    log_pushf("[sd] write error: %u/%u", written, fb->len);
     return false;
   }
   
-  log_pushf("[sd] saved %s (%u bytes)", out_filename, fb->len);
   return true;
 }
 
@@ -292,7 +260,7 @@ static bool start_video_recording() {
   
   g_video_file = SD_MMC.open(g_current_video_path, FILE_WRITE);
   if (!g_video_file) {
-    log_pushf("[sd] failed to create video file");
+    log_pushf("[sd] video create failed");
     return false;
   }
   
@@ -307,8 +275,6 @@ static bool start_video_recording() {
 static bool write_video_frame(camera_fb_t* fb) {
   if (!g_is_recording || !g_video_file) return false;
   
-  // Write MJPEG frame with boundary marker
-  // Format: --frame\r\nContent-Length: <len>\r\n\r\n<jpeg data>\r\n
   char header[64];
   int hlen = snprintf(header, sizeof(header), 
                       "--frame\r\nContent-Length: %u\r\n\r\n", fb->len);
@@ -324,9 +290,7 @@ static bool write_video_frame(camera_fb_t* fb) {
 static void stop_video_recording() {
   if (!g_is_recording) return;
   
-  if (g_video_file) {
-    g_video_file.close();
-  }
+  if (g_video_file) g_video_file.close();
   
   uint32_t duration_ms = millis() - g_recording_start_ms;
   float fps = (duration_ms > 0) ? (g_video_frame_count * 1000.0f / duration_ms) : 0;
@@ -336,213 +300,26 @@ static void stop_video_recording() {
   
   g_is_recording = false;
   g_video_frame_count = 0;
-  g_current_video_path[0] = '\0';
 }
 
-// ============================ BUTTON HANDLING ============================
+// ============================ OPTIMIZED CAMERA SETUP ============================
 
-// Button ISR - minimal work, just record timing
-static void IRAM_ATTR button_isr() {
-  uint32_t now = millis();
-  bool pressed = (digitalRead(BUTTON_PIN) == LOW);  // Active low with pull-up
-  
-  if (pressed && !g_button_pressed) {
-    // Button just pressed
-    if (now - g_button_release_time > DEBOUNCE_MS) {
-      g_button_pressed = true;
-      g_button_press_time = now;
-    }
-  } else if (!pressed && g_button_pressed) {
-    // Button just released
-    g_button_pressed = false;
-    g_button_release_time = now;
-    g_button_event_pending = true;
-    g_is_long_press = (now - g_button_press_time >= LONG_PRESS_MS);
+static void set_stream_mode() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, STREAM_FRAMESIZE);
+    s->set_quality(s, STREAM_QUALITY);
   }
 }
 
-// Process button events (called from main loop, not ISR)
-static void process_button_events() {
-  // Check for long press start (while still holding)
-  if (g_button_pressed && !g_is_recording) {
-    uint32_t hold_time = millis() - g_button_press_time;
-    if (hold_time >= LONG_PRESS_MS) {
-      // Start recording
-      log_pushf("[btn] long press detected - starting recording");
-      if (start_video_recording()) {
-        // Flash LED briefly to indicate recording started
-        set_flash(true);
-        delay(100);
-        set_flash(false);
-      }
-    }
-  }
-  
-  // If recording and button released, stop recording
-  if (g_is_recording && !g_button_pressed) {
-    stop_video_recording();
-    // Flash LED twice to indicate recording stopped
-    set_flash(true);
-    delay(100);
-    set_flash(false);
-    delay(100);
-    set_flash(true);
-    delay(100);
-    set_flash(false);
-  }
-  
-  // Process pending button event (release)
-  if (g_button_event_pending) {
-    g_button_event_pending = false;
-    
-    uint32_t press_duration = g_button_release_time - g_button_press_time;
-    log_pushf("[btn] released after %ums", press_duration);
-    
-    // Short press = capture photo (only if wasn't recording)
-    if (press_duration < LONG_PRESS_MS && !g_is_recording) {
-      log_pushf("[btn] short press - capturing photo");
-      
-      // Capture photo
-      camera_fb_t* fb = esp_camera_fb_get();
-      if (fb) {
-        char filename[64];
-        if (save_photo_to_sd(fb, filename, sizeof(filename))) {
-          // Flash LED to confirm capture
-          set_flash(true);
-          delay(50);
-          set_flash(false);
-        }
-        esp_camera_fb_return(fb);
-      } else {
-        log_pushf("[btn] capture failed - no frame buffer");
-      }
-    }
-  }
-  
-  // If recording, capture frames
-  if (g_is_recording) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-      write_video_frame(fb);
-      esp_camera_fb_return(fb);
-    }
-    
-    // Log progress periodically
-    static uint32_t last_rec_log = 0;
-    if (millis() - last_rec_log > 2000) {
-      last_rec_log = millis();
-      uint32_t duration = (millis() - g_recording_start_ms) / 1000;
-      log_pushf("[rec] recording... %us, %u frames", duration, g_video_frame_count);
-    }
+static void set_capture_mode() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, CAPTURE_FRAMESIZE);
+    s->set_quality(s, CAPTURE_QUALITY);
   }
 }
 
-// ============================ WPA2-Enterprise enable wrapper ============================
-static void wpa2_ent_enable_wrapper() {
-#if defined(WPA2_CONFIG_INIT_DEFAULT)
-  esp_wpa2_config_t cfg = WPA2_CONFIG_INIT_DEFAULT();
-  esp_wifi_sta_wpa2_ent_enable(&cfg);
-#else
-  esp_wifi_sta_wpa2_ent_enable();
-#endif
-}
-
-// ============================ WI-FI EVENTS ============================
-static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      log_pushf("[wifi] connected to AP");
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      log_pushf("[wifi] disconnected, reason=%d", (int)info.wifi_sta_disconnected.reason);
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      log_pushf("[wifi] got ip=%s", WiFi.localIP().toString().c_str());
-      break;
-    default:
-      break;
-  }
-}
-
-// ============================ WI-FI CONNECT (DUAL) ============================
-static void wifi_common_setup() {
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-}
-
-static bool connect_wifi_enterprise(uint32_t timeout_ms = 30000) {
-  if (!has_text(WIFI_ENT_SSID) || !has_text(WIFI_ENT_USER) || !has_text(WIFI_ENT_PASS)) return false;
-
-  log_pushf("[wifi] trying Enterprise SSID: %s", WIFI_ENT_SSID);
-
-  WiFi.disconnect(true);
-  delay(200);
-
-  wifi_common_setup();
-
-  const char* ident = has_text(WIFI_ENT_IDENT) ? WIFI_ENT_IDENT : WIFI_ENT_USER;
-
-  esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)ident, strlen(ident));
-  esp_wifi_sta_wpa2_ent_set_username((uint8_t*)WIFI_ENT_USER, strlen(WIFI_ENT_USER));
-  esp_wifi_sta_wpa2_ent_set_password((uint8_t*)WIFI_ENT_PASS, strlen(WIFI_ENT_PASS));
-
-  wpa2_ent_enable_wrapper();
-
-  WiFi.begin(WIFI_ENT_SSID);
-
-  const uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
-    delay(300);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    log_pushf("[wifi] Enterprise connected");
-    log_pushf("[wifi] ip=%s rssi=%d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    return true;
-  }
-
-  log_pushf("[wifi] Enterprise failed / timeout");
-  esp_wifi_sta_wpa2_ent_disable();
-  return false;
-}
-
-static bool connect_wifi_psk(uint32_t timeout_ms = 25000) {
-  if (!has_text(WIFI_PSK_SSID)) return false;
-
-  log_pushf("[wifi] trying PSK SSID: %s", WIFI_PSK_SSID);
-
-  esp_wifi_sta_wpa2_ent_disable();
-
-  WiFi.disconnect(true);
-  delay(200);
-
-  wifi_common_setup();
-
-  WiFi.begin(WIFI_PSK_SSID, WIFI_PSK_PASS);
-
-  const uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    log_pushf("[wifi] PSK connected");
-    log_pushf("[wifi] ip=%s rssi=%d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    return true;
-  }
-
-  log_pushf("[wifi] PSK failed / timeout");
-  return false;
-}
-
-static bool connect_wifi_dual() {
-  if (connect_wifi_enterprise()) return true;
-  if (connect_wifi_psk()) return true;
-  log_pushf("[wifi] no connection (check credentials / network type)");
-  return false;
-}
-
-// ============================ CAMERA SETUP ============================
 static void setup_camera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -556,24 +333,34 @@ static void setup_camera() {
   config.pin_d5       = Y7_GPIO_NUM;
   config.pin_d6       = Y8_GPIO_NUM;
   config.pin_d7       = Y9_GPIO_NUM;
-
   config.pin_xclk     = XCLK_GPIO_NUM;
   config.pin_pclk     = PCLK_GPIO_NUM;
   config.pin_vsync    = VSYNC_GPIO_NUM;
   config.pin_href     = HREF_GPIO_NUM;
-
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
-
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  config.frame_size   = FRAMESIZE_VGA;  // 640x480 for better quality
-  config.jpeg_quality = 10;             // Better quality for SD storage
-  config.fb_count     = 2;
+  // Optimized settings based on PSRAM
+  if (psramFound()) {
+    log_pushf("[cam] PSRAM found - using optimized config");
+    config.frame_size   = STREAM_FRAMESIZE;
+    config.jpeg_quality = STREAM_QUALITY;
+    config.fb_count     = 3;  // Triple buffering
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;  // Always get fresh frame
+  } else {
+    log_pushf("[cam] No PSRAM - using conservative config");
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.jpeg_quality = 15;
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  }
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -581,15 +368,216 @@ static void setup_camera() {
     while (true) delay(1000);
   }
 
-  sensor_t* s = esp_camera_sensor_get();
+  // Sensor optimizations
+  sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    log_pushf("[cam] sensor PID=0x%04x VER=0x%04x", (unsigned)s->id.PID, (unsigned)s->id.VER);
+    log_pushf("[cam] sensor PID=0x%04x", (unsigned)s->id.PID);
+    
+    // Image quality settings
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 0);
+    
+    // Auto-exposure/gain
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_gainceiling(s, GAINCEILING_4X);
+    
+    // Corrections
+    s->set_lenc(s, 1);
+    s->set_dcw(s, 1);
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_raw_gma(s, 1);
   }
-  log_pushf("[cam] config framesize=%d quality=%d fb_count=%d",
-            (int)config.frame_size, (int)config.jpeg_quality, (int)config.fb_count);
+
+  log_pushf("[cam] ready: fb_count=%d grab=LATEST", (int)config.fb_count);
 }
 
-// ============================ HTTP: SSE helpers ============================
+// ============================ BUTTON HANDLING ============================
+
+static void IRAM_ATTR button_isr() {
+  uint32_t now = millis();
+  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+  
+  if (pressed && !g_button_pressed) {
+    if (now - g_button_release_time > DEBOUNCE_MS) {
+      g_button_pressed = true;
+      g_button_press_time = now;
+    }
+  } else if (!pressed && g_button_pressed) {
+    g_button_pressed = false;
+    g_button_release_time = now;
+    g_button_event_pending = true;
+    g_is_long_press = (now - g_button_press_time >= LONG_PRESS_MS);
+  }
+}
+
+static void process_button_events() {
+  // Long press detection (start recording)
+  if (g_button_pressed && !g_is_recording) {
+    uint32_t hold_time = millis() - g_button_press_time;
+    if (hold_time >= LONG_PRESS_MS) {
+      log_pushf("[btn] long press - recording");
+      if (start_video_recording()) {
+        set_flash(true);
+        delay(100);
+        set_flash(false);
+      }
+    }
+  }
+  
+  // Stop recording on release
+  if (g_is_recording && !g_button_pressed) {
+    stop_video_recording();
+    set_flash(true); delay(100); set_flash(false);
+    delay(100);
+    set_flash(true); delay(100); set_flash(false);
+  }
+  
+  // Short press = capture photo
+  if (g_button_event_pending) {
+    g_button_event_pending = false;
+    
+    uint32_t press_duration = g_button_release_time - g_button_press_time;
+    
+    if (press_duration < LONG_PRESS_MS && !g_is_recording) {
+      log_pushf("[btn] short press - capture");
+      
+      // Switch to capture mode for quality
+      set_capture_mode();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      
+      // Flush stale frame
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) esp_camera_fb_return(fb);
+      
+      // Capture
+      fb = esp_camera_fb_get();
+      if (fb) {
+        char filename[64];
+        if (save_photo_to_sd(fb, filename, sizeof(filename))) {
+          log_pushf("[btn] saved: %s (%uB)", filename, fb->len);
+          set_flash(true); delay(50); set_flash(false);
+        }
+        esp_camera_fb_return(fb);
+      }
+      
+      // Restore stream mode
+      set_stream_mode();
+    }
+  }
+  
+  // Recording loop
+  if (g_is_recording) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      write_video_frame(fb);
+      esp_camera_fb_return(fb);
+    }
+    
+    static uint32_t last_rec_log = 0;
+    if (millis() - last_rec_log > 2000) {
+      last_rec_log = millis();
+      log_pushf("[rec] %us, %u frames", 
+                (millis() - g_recording_start_ms) / 1000, g_video_frame_count);
+    }
+  }
+}
+
+// ============================ WPA2 ENTERPRISE ============================
+static void wpa2_ent_enable_wrapper() {
+#if defined(WPA2_CONFIG_INIT_DEFAULT)
+  esp_wpa2_config_t cfg = WPA2_CONFIG_INIT_DEFAULT();
+  esp_wifi_sta_wpa2_ent_enable(&cfg);
+#else
+  esp_wifi_sta_wpa2_ent_enable();
+#endif
+}
+
+// ============================ WIFI ============================
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      log_pushf("[wifi] connected");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      log_pushf("[wifi] disconnected: %d", (int)info.wifi_sta_disconnected.reason);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      log_pushf("[wifi] ip=%s", WiFi.localIP().toString().c_str());
+      break;
+    default: break;
+  }
+}
+
+static void wifi_common_setup() {
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_NONE);  // Disable power saving for streaming
+}
+
+static bool connect_wifi_enterprise(uint32_t timeout_ms = 30000) {
+  if (!has_text(WIFI_ENT_SSID) || !has_text(WIFI_ENT_USER)) return false;
+
+  log_pushf("[wifi] trying Enterprise: %s", WIFI_ENT_SSID);
+  WiFi.disconnect(true);
+  delay(200);
+  wifi_common_setup();
+
+  const char* ident = has_text(WIFI_ENT_IDENT) ? WIFI_ENT_IDENT : WIFI_ENT_USER;
+  esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)ident, strlen(ident));
+  esp_wifi_sta_wpa2_ent_set_username((uint8_t*)WIFI_ENT_USER, strlen(WIFI_ENT_USER));
+  esp_wifi_sta_wpa2_ent_set_password((uint8_t*)WIFI_ENT_PASS, strlen(WIFI_ENT_PASS));
+  wpa2_ent_enable_wrapper();
+  WiFi.begin(WIFI_ENT_SSID);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) delay(300);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    log_pushf("[wifi] Enterprise OK, rssi=%d", WiFi.RSSI());
+    return true;
+  }
+
+  log_pushf("[wifi] Enterprise failed");
+  esp_wifi_sta_wpa2_ent_disable();
+  return false;
+}
+
+static bool connect_wifi_psk(uint32_t timeout_ms = 25000) {
+  if (!has_text(WIFI_PSK_SSID)) return false;
+
+  log_pushf("[wifi] trying PSK: %s", WIFI_PSK_SSID);
+  esp_wifi_sta_wpa2_ent_disable();
+  WiFi.disconnect(true);
+  delay(200);
+  wifi_common_setup();
+  WiFi.begin(WIFI_PSK_SSID, WIFI_PSK_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) delay(250);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    log_pushf("[wifi] PSK OK, rssi=%d", WiFi.RSSI());
+    return true;
+  }
+
+  log_pushf("[wifi] PSK failed");
+  return false;
+}
+
+static bool connect_wifi_dual() {
+  if (connect_wifi_enterprise()) return true;
+  if (connect_wifi_psk()) return true;
+  log_pushf("[wifi] no connection");
+  return false;
+}
+
+// ============================ SSE HELPERS ============================
 static void sse_send_line(httpd_req_t *req, const char* s) {
   httpd_resp_send_chunk(req, "data: ", 6);
   httpd_resp_send_chunk(req, s, strlen(s));
@@ -613,7 +601,6 @@ static void sse_send_recent(httpd_req_t *req, int max_lines) {
     portENTER_CRITICAL(&g_log_mux);
     strncpy(line, g_log[idx], LOG_LEN);
     portEXIT_CRITICAL(&g_log_mux);
-
     if (line[0] != '\0') sse_send_line(req, line);
     idx = (idx + 1) % LOG_CAP;
   }
@@ -622,7 +609,6 @@ static void sse_send_recent(httpd_req_t *req, int max_lines) {
 // ============================ HTTP HANDLERS ============================
 
 static esp_err_t log_clear_handler(httpd_req_t *req) {
-  log_pushf("HTTP /log/clear");
   log_clear();
   httpd_resp_set_type(req, "text/plain");
   return httpd_resp_sendstr(req, "ok");
@@ -637,7 +623,7 @@ static esp_err_t events_handler(httpd_req_t *req) {
   sse_send_line(req, "[SSE] connected");
   sse_send_recent(req, 120);
 
-  uint32_t last_keepalive_ms = millis();
+  uint32_t last_keepalive = millis();
   uint32_t last_seq = 0;
 
   portENTER_CRITICAL(&g_log_mux);
@@ -665,7 +651,6 @@ static esp_err_t events_handler(httpd_req_t *req) {
         portENTER_CRITICAL(&g_log_mux);
         strncpy(line, g_log[idx], LOG_LEN);
         portEXIT_CRITICAL(&g_log_mux);
-
         if (line[0] != '\0') {
           if (httpd_resp_send_chunk(req, "", 0) != ESP_OK) return ESP_FAIL;
           sse_send_line(req, line);
@@ -675,12 +660,12 @@ static esp_err_t events_handler(httpd_req_t *req) {
       last_seq = seq_now;
     }
 
-    if (millis() - last_keepalive_ms > 5000) {
-      if (httpd_resp_send_chunk(req, ": keepalive\n\n", strlen(": keepalive\n\n")) != ESP_OK) return ESP_FAIL;
-      last_keepalive_ms = millis();
+    if (millis() - last_keepalive > 5000) {
+      if (httpd_resp_send_chunk(req, ": keepalive\n\n", 13) != ESP_OK) return ESP_FAIL;
+      last_keepalive = millis();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -689,124 +674,149 @@ static esp_err_t flash_handler(httpd_req_t *req) {
   bool on = false;
 
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    char on_str[8] = {0};
-    if (httpd_query_key_value(query, "on", on_str, sizeof(on_str)) == ESP_OK) {
-      on = (strcmp(on_str, "1") == 0);
+    char val[8] = {0};
+    if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
+      on = (strcmp(val, "1") == 0);
     }
   }
 
   set_flash(on);
-  log_pushf("HTTP /flash %s", on ? "ON" : "OFF");
+  log_pushf("[flash] %s", on ? "ON" : "OFF");
 
   httpd_resp_set_type(req, "text/plain");
-  return httpd_resp_sendstr(req, on ? "flash=on" : "flash=off");
+  return httpd_resp_sendstr(req, on ? "on" : "off");
 }
 
-static esp_err_t capture_handler(httpd_req_t *req) {
-  const uint32_t t0 = millis();
-  log_pushf("HTTP /capture start");
+// ============================ OPTIMIZED CAPTURE ============================
 
+static esp_err_t capture_handler(httpd_req_t *req) {
+  uint32_t t0 = millis();
+  
+  // Switch to capture mode
+  set_capture_mode();
+  vTaskDelay(pdMS_TO_TICKS(10));
+  
   // Flush stale frame
   camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) {
-    esp_camera_fb_return(fb);
-    fb = nullptr;
-  }
-  vTaskDelay(pdMS_TO_TICKS(15));
-
+  if (fb) esp_camera_fb_return(fb);
+  
+  // Get fresh frame
   fb = esp_camera_fb_get();
   if (!fb) {
-    log_pushf("HTTP /capture failed (fb null)");
+    log_pushf("[cap] failed");
+    set_stream_mode();
     httpd_resp_send_500(req);
     return ESP_FAIL;
   }
 
-  log_pushf("HTTP /capture bytes=%u", (unsigned)fb->len);
-
   httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  httpd_resp_set_hdr(req, "Pragma", "no-cache");
-  // Add download header for optional download
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=\"capture.jpg\"");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+  
+  log_pushf("[cap] %ux%u %uB %ums", fb->width, fb->height, fb->len, millis() - t0);
+  
   esp_camera_fb_return(fb);
-
-  log_pushf("HTTP /capture done %ums", (unsigned)(millis() - t0));
+  set_stream_mode();
+  
   return res;
 }
 
-static esp_err_t stream_handler(httpd_req_t *req) {
-  log_pushf("HTTP /stream start");
+// ============================ OPTIMIZED STREAM ============================
 
+static esp_err_t stream_handler(httpd_req_t *req) {
+  log_pushf("[stream] started");
+  
+  set_stream_mode();
+  
   httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  httpd_resp_set_hdr(req, "Connection", "close");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-  uint32_t frames = 0;
-  uint32_t t_fps = millis();
+  static const char* BOUNDARY = "\r\n--frame\r\n";
+  static const char* PART_HDR = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+  char part_buf[64];
+
+  uint32_t frame_count = 0;
+  uint32_t total_bytes = 0;
+  uint32_t fps_timer = millis();
+
+  // Flush initial stale frames
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+  }
 
   while (true) {
+    uint32_t frame_start = millis();
+    
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-      log_pushf("[cam] stream fb null");
-      vTaskDelay(pdMS_TO_TICKS(30));
+      vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
 
-    esp_err_t res = httpd_resp_send_chunk(req, "--frame\r\n", strlen("--frame\r\n"));
-    if (res != ESP_OK) { esp_camera_fb_return(fb); break; }
-
-    char hdr[128];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
-                           "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                           fb->len);
-
-    res = httpd_resp_send_chunk(req, hdr, hdr_len);
-    if (res != ESP_OK) { esp_camera_fb_return(fb); break; }
-
-    res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-    if (res != ESP_OK) break;
-
-    res = httpd_resp_send_chunk(req, "\r\n", 2);
-    if (res != ESP_OK) break;
-
-    frames++;
-    const uint32_t now = millis();
-    if (now - t_fps > 3000) {
-      float fps = frames * 1000.0f / (float)(now - t_fps);
-      log_pushf("HTTP /stream fps=%.1f", fps);
-      frames = 0;
-      t_fps = now;
+    if (httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY)) != ESP_OK) {
+      esp_camera_fb_return(fb);
+      break;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(30));
+    size_t hlen = snprintf(part_buf, sizeof(part_buf), PART_HDR, fb->len);
+    if (httpd_resp_send_chunk(req, part_buf, hlen) != ESP_OK) {
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    if (httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len) != ESP_OK) {
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    total_bytes += fb->len;
+    esp_camera_fb_return(fb);
+    frame_count++;
+
+    // Adaptive delay
+    uint32_t frame_time = millis() - frame_start;
+    int32_t delay_needed = MIN_FRAME_TIME_MS - frame_time;
+    if (delay_needed > 1) {
+      vTaskDelay(pdMS_TO_TICKS(delay_needed));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    // Log stats every 5 seconds
+    uint32_t now = millis();
+    if (now - fps_timer >= 5000) {
+      float fps = frame_count * 1000.0f / (now - fps_timer);
+      float kbps = total_bytes * 8.0f / (now - fps_timer);
+      log_pushf("[stream] %.1f fps, %.0f kbps", fps, kbps);
+      frame_count = 0;
+      total_bytes = 0;
+      fps_timer = now;
+    }
   }
 
-  httpd_resp_send_chunk(req, nullptr, 0);
-  log_pushf("HTTP /stream end");
+  httpd_resp_send_chunk(req, NULL, 0);
+  log_pushf("[stream] ended");
   return ESP_OK;
 }
 
-// ============================ SD CARD HTTP HANDLERS ============================
+// ============================ SD CARD HANDLERS ============================
 
 static esp_err_t sd_status_handler(httpd_req_t *req) {
   char json[256];
   
   if (!g_sd_available) {
-    snprintf(json, sizeof(json), 
-             "{\"available\":false,\"error\":\"SD card not mounted\"}");
+    snprintf(json, sizeof(json), "{\"available\":false}");
   } else {
     uint64_t total = SD_MMC.totalBytes() / (1024 * 1024);
     uint64_t used = SD_MMC.usedBytes() / (1024 * 1024);
-    uint64_t free = total - used;
-    
     snprintf(json, sizeof(json),
-             "{\"available\":true,\"total_mb\":%llu,\"used_mb\":%llu,\"free_mb\":%llu,"
-             "\"photo_count\":%u,\"video_count\":%u,\"recording\":%s}",
-             total, used, free, g_photo_counter, g_video_counter,
-             g_is_recording ? "true" : "false");
+             "{\"available\":true,\"total_mb\":%llu,\"used_mb\":%llu,\"free_mb\":%llu,\"recording\":%s}",
+             total, used, total - used, g_is_recording ? "true" : "false");
   }
   
   httpd_resp_set_type(req, "application/json");
@@ -817,68 +827,46 @@ static esp_err_t sd_status_handler(httpd_req_t *req) {
 static esp_err_t sd_list_handler(httpd_req_t *req) {
   if (!g_sd_available) {
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_sendstr(req, "{\"error\":\"SD card not available\",\"files\":[]}");
+    return httpd_resp_sendstr(req, "{\"files\":[]}");
   }
   
-  // Get optional type filter from query
-  char query[32] = {0};
-  char type_filter[16] = {0};  // "photo", "video", or "" for all
-  
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    httpd_query_key_value(query, "type", type_filter, sizeof(type_filter));
-  }
-  
-  // Build JSON response
   String json = "{\"files\":[";
   bool first = true;
   
-  // List photos
-  if (strlen(type_filter) == 0 || strcmp(type_filter, "photo") == 0) {
-    File dir = SD_MMC.open("/photos");
-    if (dir) {
-      File file = dir.openNextFile();
-      while (file) {
-        if (!file.isDirectory()) {
-          if (!first) json += ",";
-          first = false;
-          
-          json += "{\"name\":\"";
-          json += file.name();
-          json += "\",\"path\":\"/photos/";
-          json += file.name();
-          json += "\",\"size\":";
-          json += String(file.size());
-          json += ",\"type\":\"photo\"}";
-        }
-        file = dir.openNextFile();
+  // Photos
+  File dir = SD_MMC.open("/photos");
+  if (dir) {
+    File file = dir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + String(file.name()) + 
+                "\",\"path\":\"/photos/" + String(file.name()) + 
+                "\",\"size\":" + String(file.size()) + 
+                ",\"type\":\"photo\"}";
       }
-      dir.close();
+      file = dir.openNextFile();
     }
+    dir.close();
   }
   
-  // List videos
-  if (strlen(type_filter) == 0 || strcmp(type_filter, "video") == 0) {
-    File dir = SD_MMC.open("/videos");
-    if (dir) {
-      File file = dir.openNextFile();
-      while (file) {
-        if (!file.isDirectory()) {
-          if (!first) json += ",";
-          first = false;
-          
-          json += "{\"name\":\"";
-          json += file.name();
-          json += "\",\"path\":\"/videos/";
-          json += file.name();
-          json += "\",\"size\":";
-          json += String(file.size());
-          json += ",\"type\":\"video\"}";
-        }
-        file = dir.openNextFile();
+  // Videos
+  dir = SD_MMC.open("/videos");
+  if (dir) {
+    File file = dir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + String(file.name()) + 
+                "\",\"path\":\"/videos/" + String(file.name()) + 
+                "\",\"size\":" + String(file.size()) + 
+                ",\"type\":\"video\"}";
       }
-      dir.close();
+      file = dir.openNextFile();
     }
+    dir.close();
   }
   
   json += "]}";
@@ -890,32 +878,22 @@ static esp_err_t sd_list_handler(httpd_req_t *req) {
 
 static esp_err_t sd_download_handler(httpd_req_t *req) {
   if (!g_sd_available) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not available");
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No SD");
     return ESP_FAIL;
   }
   
   char query[128] = {0};
   char filepath[96] = {0};
   
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing file parameter");
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+      httpd_query_key_value(query, "file", filepath, sizeof(filepath)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing file");
     return ESP_FAIL;
   }
   
-  if (httpd_query_key_value(query, "file", filepath, sizeof(filepath)) != ESP_OK) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing file parameter");
-    return ESP_FAIL;
-  }
-  
-  // URL decode the filepath (handle %2F for /)
-  // Simple decode for common cases
   String path = filepath;
   path.replace("%2F", "/");
-  path.replace("%20", " ");
   
-  log_pushf("HTTP /sd/download file=%s", path.c_str());
-  
-  // Security check: prevent directory traversal
   if (path.indexOf("..") >= 0) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
     return ESP_FAIL;
@@ -923,68 +901,45 @@ static esp_err_t sd_download_handler(httpd_req_t *req) {
   
   File file = SD_MMC.open(path.c_str(), FILE_READ);
   if (!file) {
-    log_pushf("[sd] file not found: %s", path.c_str());
-    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
     return ESP_FAIL;
   }
   
-  // Determine content type
-  const char* content_type = "application/octet-stream";
-  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
-    content_type = "image/jpeg";
-  } else if (path.endsWith(".mjpeg")) {
-    content_type = "video/x-motion-jpeg";
-  }
-  
-  // Extract filename for Content-Disposition
+  const char* ctype = path.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
   int lastSlash = path.lastIndexOf('/');
-  String filename = (lastSlash >= 0) ? path.substring(lastSlash + 1) : path;
+  String fname = (lastSlash >= 0) ? path.substring(lastSlash + 1) : path;
   
-  char disposition[128];
-  snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"", filename.c_str());
+  char disp[128];
+  snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", fname.c_str());
   
-  httpd_resp_set_type(req, content_type);
-  httpd_resp_set_hdr(req, "Content-Disposition", disposition);
+  httpd_resp_set_type(req, ctype);
+  httpd_resp_set_hdr(req, "Content-Disposition", disp);
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   
-  // Stream file in chunks
-  const size_t CHUNK_SIZE = 4096;
-  uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE);
-  if (!buffer) {
+  const size_t CHUNK = 4096;
+  uint8_t* buf = (uint8_t*)malloc(CHUNK);
+  if (!buf) {
     file.close();
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory error");
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory");
     return ESP_FAIL;
   }
   
-  size_t total_sent = 0;
-  size_t file_size = file.size();
-  
   while (file.available()) {
-    size_t bytes_read = file.read(buffer, CHUNK_SIZE);
-    if (bytes_read > 0) {
-      if (httpd_resp_send_chunk(req, (const char*)buffer, bytes_read) != ESP_OK) {
-        free(buffer);
-        file.close();
-        return ESP_FAIL;
-      }
-      total_sent += bytes_read;
-    }
+    size_t n = file.read(buf, CHUNK);
+    if (n > 0 && httpd_resp_send_chunk(req, (char*)buf, n) != ESP_OK) break;
   }
   
-  free(buffer);
+  free(buf);
   file.close();
-  
-  // End chunked response
   httpd_resp_send_chunk(req, NULL, 0);
   
-  log_pushf("[sd] download complete: %u bytes", total_sent);
   return ESP_OK;
 }
 
 static esp_err_t sd_delete_handler(httpd_req_t *req) {
   if (!g_sd_available) {
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"SD card not available\"}");
+    return httpd_resp_sendstr(req, "{\"success\":false}");
   }
   
   char query[128] = {0};
@@ -993,677 +948,376 @@ static esp_err_t sd_delete_handler(httpd_req_t *req) {
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
       httpd_query_key_value(query, "file", filepath, sizeof(filepath)) != ESP_OK) {
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Missing file parameter\"}");
+    return httpd_resp_sendstr(req, "{\"success\":false}");
   }
   
   String path = filepath;
   path.replace("%2F", "/");
-  path.replace("%20", " ");
   
-  log_pushf("HTTP /sd/delete file=%s", path.c_str());
+  bool ok = SD_MMC.remove(path.c_str());
+  log_pushf("[sd] delete %s: %s", path.c_str(), ok ? "OK" : "FAIL");
   
-  if (path.indexOf("..") >= 0) {
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Invalid path\"}");
-  }
-  
-  if (!SD_MMC.exists(path.c_str())) {
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"File not found\"}");
-  }
-  
-  if (SD_MMC.remove(path.c_str())) {
-    log_pushf("[sd] deleted: %s", path.c_str());
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_sendstr(req, "{\"success\":true}");
-  } else {
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Delete failed\"}");
-  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_sendstr(req, ok ? "{\"success\":true}" : "{\"success\":false}");
 }
 
-// ============================ HTML UI (Updated for v2) ============================
+// ============================ HTML UI ============================
 
 static esp_err_t index_handler(httpd_req_t *req) {
-  log_pushf("HTTP / (UI loaded)");
+  log_pushf("[ui] loaded");
 
   static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Joint_CM_2026 v2</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Joint_CM v2.1</title>
   <style>
-    :root{ --r:16px; --b:1px solid #e8e8e8; --pad:14px; }
-    body{
-      font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-      margin:12px; max-width:1400px;
-      padding-bottom: env(safe-area-inset-bottom);
-    }
-    h2{ margin:0 0 10px 0; font-size:22px; }
-    .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    .grow{ flex:1; }
-    button{
-      padding:10px 12px; border:1px solid #cfcfcf; border-radius:12px;
-      background:#fff; cursor:pointer; font-size:14px;
-    }
-    button.primary{ border-color:#111; }
-    button.danger{ border-color:#b00020; color:#b00020; }
-    button.success{ border-color:#007700; color:#007700; }
-    button:disabled{ opacity:.5; cursor:not-allowed; }
-    .pill{
-      display:inline-block; padding:6px 10px; border-radius:999px;
-      border:var(--b); font-size:13px; background:#fff;
-    }
-    .pill.recording{ background:#ff4444; color:#fff; border-color:#ff4444; animation: pulse 1s infinite; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.7} }
-    .muted{ opacity:.75; }
-    .panel{ border:var(--b); border-radius:var(--r); padding:var(--pad); margin-top:12px; background:#fff; }
-
-    .layout{ display:grid; grid-template-columns: 1fr 380px; gap:12px; align-items:start; }
-    @media (max-width: 900px){ .layout{ grid-template-columns: 1fr; } }
-
-    .toolbar{
-      display:flex; gap:10px; flex-wrap:wrap; align-items:center;
-      justify-content: space-between; margin-top:8px;
-    }
-    .toolbarLeft,.toolbarRight{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-
-    .previewWrap{
-      border:var(--b); border-radius:50%; overflow:hidden; position:relative;
-      width:100%; max-width:720px; aspect-ratio:1/1; margin-top:10px;
-      background:#f4f4f4;
-    }
-    .previewWrap.idle{ background: linear-gradient(135deg,#f0f0f0,#dedede); }
-    .previewWrap img{
-      width:100%; height:100%; object-fit:cover; object-position:center; display:block;
-      transform: rotate(180deg); transform-origin: center center;
-    }
-    .placeholder{
-      width:100%; height:100%;
-      display:flex; align-items:center; justify-content:center;
-      color:#666; font-size:14px; letter-spacing:.2px; padding:12px; text-align:center;
-    }
-    .overlayTag{
-      position:absolute; top:10px; left:10px;
-      background: rgba(0,0,0,.55); color:#fff; padding:6px 10px;
-      border-radius:999px; font-size:12px; backdrop-filter: blur(6px);
-    }
-    .downloadBtn{
-      position:absolute; bottom:10px; right:10px;
-      background: rgba(0,0,0,.55); color:#fff; padding:8px 12px;
-      border-radius:12px; font-size:12px; backdrop-filter: blur(6px);
-      border:none; cursor:pointer;
-    }
-    .downloadBtn:hover{ background: rgba(0,0,0,.75); }
-
-    .galleryHead{ display:flex; align-items:center; gap:10px; margin-top:12px; }
-    .tabs{ display:flex; gap:5px; }
-    .tab{ padding:6px 12px; border:var(--b); border-radius:8px; cursor:pointer; font-size:13px; background:#fff; }
-    .tab.active{ background:#111; color:#fff; border-color:#111; }
-    
-    .thumbs{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
-    .thumb{
-      width:128px; aspect-ratio:1/1; border:var(--b); border-radius:14px; overflow:hidden; background:#fff;
-      position:relative;
-    }
-    .thumb img{
-      width:100%; height:100%; object-fit:cover; display:block; cursor:pointer;
-      transform: rotate(180deg); transform-origin: center center;
-    }
-    .thumb .badge{
-      position:absolute; bottom:4px; left:4px;
-      background:rgba(0,0,0,.6); color:#fff; padding:2px 6px;
-      border-radius:6px; font-size:10px;
-    }
-    .thumb .actions{
-      position:absolute; top:4px; right:4px;
-      display:flex; gap:4px; opacity:0; transition: opacity 0.2s;
-    }
-    .thumb:hover .actions{ opacity:1; }
-    .thumb .actionBtn{
-      width:24px; height:24px; border-radius:6px;
-      background:rgba(0,0,0,.6); color:#fff; border:none;
-      cursor:pointer; font-size:12px; display:flex; align-items:center; justify-content:center;
-    }
-
-    .sidebar{ display:flex; flex-direction:column; gap:12px; }
-    
-    .sdPanel{ border:var(--b); border-radius:var(--r); padding:var(--pad); background:#fff; }
-    .sdHead{ display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-    .sdStatus{ font-size:13px; }
-    .sdBar{ height:8px; background:#eee; border-radius:4px; overflow:hidden; margin:8px 0; }
-    .sdBarFill{ height:100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); border-radius:4px; }
-    .sdFiles{ max-height:300px; overflow:auto; }
-    .sdFile{
-      display:flex; align-items:center; gap:8px; padding:8px;
-      border-bottom:1px solid #eee; font-size:13px;
-    }
-    .sdFile:last-child{ border-bottom:none; }
-    .sdFile .icon{ font-size:18px; }
-    .sdFile .name{ flex:1; word-break:break-all; }
-    .sdFile .size{ color:#888; font-size:12px; }
-    .sdFile button{ padding:4px 8px; font-size:11px; }
-
-    .term{ border:var(--b); border-radius:var(--r); padding:var(--pad); background:#fff; }
-    .termHead{ display:flex; gap:8px; align-items:center; margin-bottom:10px; }
-    .termBox{
-      height:400px; overflow:auto; background:#3a3a3a; color:#f1f1f1;
-      border-radius:14px; padding:10px;
-      font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
-      font-size:12px; line-height:1.35; white-space: pre-wrap; word-break: break-word;
-    }
-    @media (max-width: 430px){ .termBox{ height:280px; } button{ font-size:13px; } }
+    :root{--r:16px;--b:1px solid #e8e8e8;--pad:14px}
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,sans-serif;margin:12px;max-width:1400px;padding-bottom:env(safe-area-inset-bottom)}
+    h2{margin:0 0 10px;font-size:22px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .grow{flex:1}
+    button{padding:10px 12px;border:1px solid #cfcfcf;border-radius:12px;background:#fff;cursor:pointer;font-size:14px}
+    button.primary{border-color:#111}
+    button.danger{border-color:#b00020;color:#b00020}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:var(--b);font-size:13px;background:#fff}
+    .pill.rec{background:#ff4444;color:#fff;border-color:#ff4444;animation:pulse 1s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}
+    .muted{opacity:.75}
+    .panel{border:var(--b);border-radius:var(--r);padding:var(--pad);margin-top:12px;background:#fff}
+    .layout{display:grid;grid-template-columns:1fr 380px;gap:12px;align-items:start}
+    @media(max-width:900px){.layout{grid-template-columns:1fr}}
+    .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-top:8px}
+    .toolbarLeft,.toolbarRight{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .previewWrap{border:var(--b);border-radius:50%;overflow:hidden;position:relative;width:100%;max-width:720px;aspect-ratio:1/1;margin-top:10px;background:#f4f4f4}
+    .previewWrap.idle{background:linear-gradient(135deg,#f0f0f0,#dedede)}
+    .previewWrap img{width:100%;height:100%;object-fit:cover;display:block;transform:rotate(180deg)}
+    .placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:14px;text-align:center;padding:12px}
+    .overlayTag{position:absolute;top:10px;left:10px;background:rgba(0,0,0,.55);color:#fff;padding:6px 10px;border-radius:999px;font-size:12px;backdrop-filter:blur(6px)}
+    .downloadBtn{position:absolute;bottom:10px;right:10px;background:rgba(0,0,0,.55);color:#fff;padding:8px 12px;border-radius:12px;font-size:12px;backdrop-filter:blur(6px);border:none;cursor:pointer}
+    .galleryHead{display:flex;align-items:center;gap:10px;margin-top:12px}
+    .tabs{display:flex;gap:5px}
+    .tab{padding:6px 12px;border:var(--b);border-radius:8px;cursor:pointer;font-size:13px;background:#fff}
+    .tab.active{background:#111;color:#fff;border-color:#111}
+    .thumbs{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .thumb{width:100px;aspect-ratio:1/1;border:var(--b);border-radius:14px;overflow:hidden;background:#fff;position:relative}
+    .thumb img{width:100%;height:100%;object-fit:cover;cursor:pointer;transform:rotate(180deg)}
+    .thumb .badge{position:absolute;bottom:4px;left:4px;background:rgba(0,0,0,.6);color:#fff;padding:2px 6px;border-radius:6px;font-size:10px}
+    .sidebar{display:flex;flex-direction:column;gap:12px}
+    .sdPanel{border:var(--b);border-radius:var(--r);padding:var(--pad);background:#fff}
+    .sdHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+    .sdBar{height:8px;background:#eee;border-radius:4px;overflow:hidden;margin:8px 0}
+    .sdBarFill{height:100%;background:linear-gradient(90deg,#4CAF50,#8BC34A);border-radius:4px}
+    .sdFiles{max-height:250px;overflow:auto}
+    .sdFile{display:flex;align-items:center;gap:8px;padding:6px;border-bottom:1px solid #eee;font-size:12px}
+    .sdFile .name{flex:1;word-break:break-all}
+    .sdFile button{padding:4px 8px;font-size:11px}
+    .term{border:var(--b);border-radius:var(--r);padding:var(--pad);background:#fff}
+    .termHead{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+    .termBox{height:350px;overflow:auto;background:#3a3a3a;color:#f1f1f1;border-radius:14px;padding:10px;font-family:ui-monospace,monospace;font-size:11px;line-height:1.3;white-space:pre-wrap;word-break:break-word}
+    .fps{position:absolute;top:10px;right:10px;background:rgba(0,0,0,.55);color:#0f0;padding:4px 8px;border-radius:8px;font-size:11px;font-family:monospace}
   </style>
 </head>
 <body>
-  <h2>Joint_CM_2026 v2</h2>
-
+  <h2>Joint_CM v2.1 ⚡</h2>
   <div class="layout">
     <div>
       <div class="row">
-        <span class="pill" id="modePill">Mode: Photo</span>
+        <span class="pill" id="modePill">Photo</span>
         <span class="pill muted" id="statusPill">Idle</span>
-        <span class="pill" id="recPill" style="display:none">● REC</span>
+        <span class="pill rec" id="recPill" style="display:none">● REC</span>
         <div class="grow"></div>
-        <button id="photoModeBtn" class="primary">Photo mode</button>
-        <button id="videoModeBtn">Video mode</button>
+        <button id="photoBtn" class="primary">📷 Photo</button>
+        <button id="videoBtn">🎬 Video</button>
       </div>
-
       <div class="panel">
         <div class="toolbar">
           <div class="toolbarLeft">
-            <button id="captureBtn" class="primary">📷 Capture</button>
-            <button id="startVideoBtn">▶ Start video</button>
-            <button id="stopVideoBtn" class="danger" disabled>■ Stop video</button>
+            <button id="captureBtn" class="primary">Capture</button>
+            <button id="startBtn">▶ Stream</button>
+            <button id="stopBtn" class="danger" disabled>■ Stop</button>
           </div>
           <div class="toolbarRight">
-            <button id="flashOnBtn">💡 Flash on</button>
-            <button id="flashOffBtn">Flash off</button>
+            <button id="flashOn">💡 On</button>
+            <button id="flashOff">Off</button>
           </div>
         </div>
-
         <div class="previewWrap idle" id="previewWrap">
-          <div class="overlayTag" id="overlayTag">Idle</div>
-          <div class="placeholder" id="placeholder">Preview window ready<br><small>Use button: Click=Photo, Hold=Video</small></div>
-          <img id="previewImg" alt="" style="display:none" />
-          <button class="downloadBtn" id="previewDownload" style="display:none">⬇ Download</button>
+          <div class="overlayTag" id="overlay">Idle</div>
+          <div class="fps" id="fpsDisplay" style="display:none">-- fps</div>
+          <div class="placeholder" id="placeholder">Ready<br><small>Button: Click=Photo, Hold=Video</small></div>
+          <img id="previewImg" alt="" style="display:none"/>
+          <button class="downloadBtn" id="dlBtn" style="display:none">⬇ Download</button>
         </div>
-
         <div class="galleryHead">
           <strong>Gallery</strong>
           <div class="tabs">
-            <div class="tab active" data-tab="memory">Memory</div>
+            <div class="tab active" data-tab="mem">Memory</div>
             <div class="tab" data-tab="sd">SD Card</div>
           </div>
-          <span class="pill muted" id="galleryCount">0 items</span>
+          <span class="pill muted" id="galCount">0</span>
           <div class="grow"></div>
-          <button id="refreshGalleryBtn">↻ Refresh</button>
-          <button id="clearGalleryBtn">Clear</button>
+          <button id="refreshBtn">↻</button>
+          <button id="clearBtn">Clear</button>
         </div>
         <div class="thumbs" id="thumbs"></div>
-
-        <p class="muted" style="margin:10px 0 0 0;font-size:13px">
-          <b>Memory:</b> Web captures (clears on refresh) &nbsp;|&nbsp; <b>SD Card:</b> Button captures (persistent)
-        </p>
       </div>
     </div>
-
     <aside class="sidebar">
       <div class="sdPanel">
         <div class="sdHead">
           <strong>💾 SD Card</strong>
-          <span class="pill muted" id="sdStatusPill">Checking...</span>
+          <span class="pill muted" id="sdPill">...</span>
           <div class="grow"></div>
-          <button id="sdRefreshBtn">↻</button>
+          <button id="sdRefresh">↻</button>
         </div>
-        <div id="sdStatusArea">
-          <div class="sdStatus" id="sdStatusText">Loading...</div>
-          <div class="sdBar"><div class="sdBarFill" id="sdBarFill" style="width:0%"></div></div>
-        </div>
+        <div id="sdStatus">Loading...</div>
+        <div class="sdBar"><div class="sdBarFill" id="sdBar" style="width:0"></div></div>
         <div class="sdFiles" id="sdFiles"></div>
       </div>
-
       <div class="term">
         <div class="termHead">
           <strong>Terminal</strong>
-          <span class="pill muted" id="termStatus">Connecting…</span>
+          <span class="pill muted" id="termPill">...</span>
           <div class="grow"></div>
-          <button id="termClearBtn">Clear</button>
+          <button id="termClear">Clear</button>
         </div>
         <div class="termBox" id="termBox"></div>
       </div>
     </aside>
   </div>
-
 <script>
-  // Elements
-  const modePill = document.getElementById('modePill');
-  const statusPill = document.getElementById('statusPill');
-  const recPill = document.getElementById('recPill');
-  const overlayTag = document.getElementById('overlayTag');
+const $ = id => document.getElementById(id);
+let mode='photo',streaming=false,memGal=[],sdGal=[],tab='mem',curBlob=null;
 
-  const photoModeBtn = document.getElementById('photoModeBtn');
-  const videoModeBtn = document.getElementById('videoModeBtn');
+// FPS tracking
+let frameCount=0,lastFpsTime=Date.now();
 
-  const captureBtn = document.getElementById('captureBtn');
-  const startVideoBtn = document.getElementById('startVideoBtn');
-  const stopVideoBtn = document.getElementById('stopVideoBtn');
+function setStatus(t){$('statusPill').textContent=t}
+function setOverlay(t){$('overlay').textContent=t}
 
-  const flashOnBtn = document.getElementById('flashOnBtn');
-  const flashOffBtn = document.getElementById('flashOffBtn');
+function showIdle(t){
+  streaming=false;
+  $('previewWrap').classList.add('idle');
+  $('previewImg').style.display='none';
+  $('placeholder').style.display='flex';
+  $('placeholder').innerHTML=t;
+  $('dlBtn').style.display='none';
+  $('fpsDisplay').style.display='none';
+  setOverlay('Idle');
+  curBlob=null;
+}
 
-  const previewWrap = document.getElementById('previewWrap');
-  const placeholder = document.getElementById('placeholder');
-  const previewImg = document.getElementById('previewImg');
-  const previewDownload = document.getElementById('previewDownload');
+function showImg(src,label,blob=null){
+  $('previewWrap').classList.remove('idle');
+  $('placeholder').style.display='none';
+  $('previewImg').style.display='block';
+  $('previewImg').src=src;
+  setOverlay(label);
+  curBlob=blob;
+  $('dlBtn').style.display=blob?'block':'none';
+}
 
-  const thumbs = document.getElementById('thumbs');
-  const galleryCount = document.getElementById('galleryCount');
-  const clearGalleryBtn = document.getElementById('clearGalleryBtn');
-  const refreshGalleryBtn = document.getElementById('refreshGalleryBtn');
-
-  const termBox = document.getElementById('termBox');
-  const termStatus = document.getElementById('termStatus');
-  const termClearBtn = document.getElementById('termClearBtn');
-
-  const sdStatusPill = document.getElementById('sdStatusPill');
-  const sdStatusText = document.getElementById('sdStatusText');
-  const sdBarFill = document.getElementById('sdBarFill');
-  const sdFiles = document.getElementById('sdFiles');
-  const sdRefreshBtn = document.getElementById('sdRefreshBtn');
-
-  let mode = "photo";
-  let streaming = false;
-  let memoryGallery = [];
-  let sdGallery = [];
-  let currentTab = "memory";
-  let lastObjectUrl = null;
-  let currentPreviewBlob = null;
-
-  function setStatus(text){ statusPill.textContent = text; }
-  function setOverlay(text){ overlayTag.textContent = text; }
-
-  function showIdle(label){
-    streaming = false;
-    previewWrap.classList.add('idle');
-    previewImg.style.display = 'none';
-    placeholder.style.display = 'flex';
-    placeholder.innerHTML = label;
-    previewDownload.style.display = 'none';
-    setOverlay("Idle");
-
-    if (lastObjectUrl) {
-      URL.revokeObjectURL(lastObjectUrl);
-      lastObjectUrl = null;
-    }
-    currentPreviewBlob = null;
-    previewImg.removeAttribute("src");
+function setMode(m){
+  mode=m;
+  if(streaming)stopStream();
+  if(m==='photo'){
+    $('modePill').textContent='Photo';
+    $('captureBtn').disabled=false;
+    $('startBtn').disabled=true;
+    $('stopBtn').disabled=true;
+    $('photoBtn').classList.add('primary');
+    $('videoBtn').classList.remove('primary');
+    showIdle('Photo mode ready');
+    setStatus('Photo ready');
+  }else{
+    $('modePill').textContent='Video';
+    $('captureBtn').disabled=true;
+    $('startBtn').disabled=false;
+    $('stopBtn').disabled=true;
+    $('photoBtn').classList.remove('primary');
+    $('videoBtn').classList.add('primary');
+    showIdle('Video mode ready');
+    setStatus('Video ready');
   }
+}
 
-  function showImage(src, overlayText, blob = null){
-    previewWrap.classList.remove('idle');
-    placeholder.style.display = 'none';
-    previewImg.style.display = 'block';
-    previewImg.src = src;
-    setOverlay(overlayText);
-    currentPreviewBlob = blob;
-    previewDownload.style.display = blob ? 'block' : 'none';
-  }
-
-  function setMode(newMode){
-    mode = newMode;
-    if (streaming) stopStream();
-
-    if (mode === "photo") {
-      modePill.textContent = "Mode: Photo";
-      captureBtn.disabled = false;
-      startVideoBtn.disabled = true;
-      stopVideoBtn.disabled = true;
-      photoModeBtn.classList.add("primary");
-      videoModeBtn.classList.remove("primary");
-      showIdle("Photo mode: ready<br><small>Click button or use web capture</small>");
-      setStatus("Photo ready");
-    } else {
-      modePill.textContent = "Mode: Video";
-      captureBtn.disabled = true;
-      startVideoBtn.disabled = false;
-      stopVideoBtn.disabled = true;
-      photoModeBtn.classList.remove("primary");
-      videoModeBtn.classList.add("primary");
-      showIdle("Video mode: ready<br><small>Hold button or use web controls</small>");
-      setStatus("Video ready");
-    }
-  }
-
-  function updateGalleryUI(){
-    const items = currentTab === "memory" ? memoryGallery : sdGallery;
-    galleryCount.textContent = `${items.length} item${items.length === 1 ? "" : "s"}`;
-    
-    thumbs.innerHTML = "";
-    items.forEach((item, idx) => {
-      const card = document.createElement('div');
-      card.className = 'thumb';
-
-      const img = document.createElement('img');
-      if (item.type === 'memory') {
-        img.src = item.url;
-      } else {
-        // For SD files, use a placeholder or first frame
-        img.src = item.isVideo ? '/capture' : `/sd/download?file=${encodeURIComponent(item.path)}`;
-      }
-      img.alt = item.name || "capture";
-      img.onclick = () => {
-        if (item.type === 'memory') {
-          showImage(item.url, "Photo", item.blob);
-        } else {
-          window.open(`/sd/download?file=${encodeURIComponent(item.path)}`, '_blank');
-        }
-        setStatus("Viewing: " + (item.name || "Photo"));
-      };
-
-      const badge = document.createElement('div');
-      badge.className = 'badge';
-      badge.textContent = item.isVideo ? '🎬' : '📷';
-      if (item.size) badge.textContent += ` ${formatSize(item.size)}`;
-
-      const actions = document.createElement('div');
-      actions.className = 'actions';
-
-      const dlBtn = document.createElement('button');
-      dlBtn.className = 'actionBtn';
-      dlBtn.innerHTML = '⬇';
-      dlBtn.title = 'Download';
-      dlBtn.onclick = (e) => {
-        e.stopPropagation();
-        downloadItem(item);
-      };
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'actionBtn';
-      delBtn.innerHTML = '✕';
-      delBtn.title = 'Delete';
-      delBtn.onclick = (e) => {
-        e.stopPropagation();
-        deleteItem(item, idx);
-      };
-
-      actions.appendChild(dlBtn);
-      actions.appendChild(delBtn);
-
-      card.appendChild(img);
-      card.appendChild(badge);
-      card.appendChild(actions);
-      thumbs.prepend(card);
-    });
-  }
-
-  function formatSize(bytes) {
-    if (bytes < 1024) return bytes + 'B';
-    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + 'KB';
-    return (bytes/1024/1024).toFixed(1) + 'MB';
-  }
-
-  function downloadItem(item) {
-    if (item.type === 'memory' && item.blob) {
-      const a = document.createElement('a');
-      a.href = item.url;
-      a.download = item.name || `capture_${Date.now()}.jpg`;
-      a.click();
-    } else if (item.path) {
-      const a = document.createElement('a');
-      a.href = `/sd/download?file=${encodeURIComponent(item.path)}`;
-      a.download = item.name;
-      a.click();
-    }
-  }
-
-  async function deleteItem(item, idx) {
-    if (item.type === 'memory') {
-      URL.revokeObjectURL(item.url);
-      memoryGallery.splice(idx, 1);
-      updateGalleryUI();
-    } else if (item.path) {
-      if (!confirm(`Delete ${item.name}?`)) return;
-      try {
-        const res = await fetch(`/sd/delete?file=${encodeURIComponent(item.path)}`);
-        const data = await res.json();
-        if (data.success) {
-          await loadSDFiles();
-          updateGalleryUI();
-        } else {
-          alert('Delete failed: ' + (data.error || 'Unknown error'));
-        }
-      } catch (e) {
-        alert('Delete failed');
-      }
-    }
-  }
-
-  function addToMemoryGallery(blob, name){
-    const url = URL.createObjectURL(blob);
-    memoryGallery.push({ type: 'memory', url, blob, name: name || `IMG_${Date.now()}.jpg`, size: blob.size });
-    if (currentTab === 'memory') updateGalleryUI();
-  }
-
-  async function capturePhoto(){
-    setStatus("Capturing…");
-    setOverlay("Capturing");
-    previewWrap.classList.remove('idle');
-    placeholder.style.display = 'flex';
-    placeholder.textContent = "Capturing…";
-    previewImg.style.display = 'none';
-    previewDownload.style.display = 'none';
-
-    try {
-      const res = await fetch("/capture?t=" + Date.now(), { cache: "no-store" });
-      if (!res.ok) throw new Error("capture failed");
-      const blob = await res.blob();
-
-      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
-      lastObjectUrl = URL.createObjectURL(blob);
-
-      showImage(lastObjectUrl, "Photo", blob);
-      setStatus("Photo captured");
-      addToMemoryGallery(blob);
-    } catch (e) {
-      showIdle("Capture failed (check connection)");
-      setStatus("Capture failed");
-    }
-  }
-
-  function startStream(){
-    setStatus("Streaming…");
-    streaming = true;
-    startVideoBtn.disabled = true;
-    stopVideoBtn.disabled = false;
-    previewDownload.style.display = 'none';
-    showImage("/stream", "Live");
-  }
-
-  function stopStream(){
-    streaming = false;
-    startVideoBtn.disabled = false;
-    stopVideoBtn.disabled = true;
-    previewImg.removeAttribute("src");
-    setTimeout(() => showIdle("Stream stopped"), 100);
-    setStatus("Stream stopped");
-  }
-
-  async function flash(on){
-    setStatus(on ? "Flash on" : "Flash off");
-    try {
-      await fetch("/flash?on=" + (on ? "1" : "0"), { cache: "no-store" });
-    } catch (e) {
-      setStatus("Flash request failed");
-    }
-  }
-
-  function clearGallery(){
-    if (currentTab === 'memory') {
-      for (const item of memoryGallery) URL.revokeObjectURL(item.url);
-      memoryGallery = [];
-    }
-    updateGalleryUI();
-    setStatus("Gallery cleared");
-  }
-
-  // SD Card functions
-  async function loadSDStatus() {
-    try {
-      const res = await fetch('/sd/status');
-      const data = await res.json();
-      
-      if (data.available) {
-        sdStatusPill.textContent = 'Ready';
-        sdStatusPill.classList.remove('recording');
-        
-        const usedPct = (data.used_mb / data.total_mb * 100).toFixed(1);
-        sdBarFill.style.width = usedPct + '%';
-        sdStatusText.textContent = `${data.used_mb}MB / ${data.total_mb}MB (${data.free_mb}MB free)`;
-        
-        if (data.recording) {
-          sdStatusPill.textContent = '● REC';
-          sdStatusPill.classList.add('recording');
-          recPill.style.display = 'inline-block';
-          recPill.classList.add('recording');
-        } else {
-          recPill.style.display = 'none';
-          recPill.classList.remove('recording');
-        }
-      } else {
-        sdStatusPill.textContent = 'No Card';
-        sdStatusText.textContent = data.error || 'SD card not available';
-        sdBarFill.style.width = '0%';
-      }
-    } catch (e) {
-      sdStatusPill.textContent = 'Error';
-      sdStatusText.textContent = 'Failed to load SD status';
-    }
-  }
-
-  async function loadSDFiles() {
-    try {
-      const res = await fetch('/sd/list');
-      const data = await res.json();
-      
-      sdGallery = (data.files || []).map(f => ({
-        type: 'sd',
-        name: f.name,
-        path: f.path,
-        size: f.size,
-        isVideo: f.type === 'video'
-      }));
-      
-      // Update SD panel file list
-      sdFiles.innerHTML = '';
-      sdGallery.slice().reverse().forEach(f => {
-        const div = document.createElement('div');
-        div.className = 'sdFile';
-        div.innerHTML = `
-          <span class="icon">${f.isVideo ? '🎬' : '📷'}</span>
-          <span class="name">${f.name}</span>
-          <span class="size">${formatSize(f.size)}</span>
-          <button onclick="window.open('/sd/download?file=${encodeURIComponent(f.path)}')">⬇</button>
-        `;
-        sdFiles.appendChild(div);
-      });
-      
-      if (currentTab === 'sd') updateGalleryUI();
-    } catch (e) {
-      sdFiles.innerHTML = '<div class="sdFile">Failed to load files</div>';
-    }
-  }
-
-  // Preview download
-  previewDownload.onclick = () => {
-    if (currentPreviewBlob) {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(currentPreviewBlob);
-      a.download = `capture_${Date.now()}.jpg`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-    }
-  };
-
-  // Tab switching
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.onclick = () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      currentTab = tab.dataset.tab;
-      updateGalleryUI();
+function updateGal(){
+  const items=tab==='mem'?memGal:sdGal;
+  $('galCount').textContent=items.length;
+  $('thumbs').innerHTML='';
+  items.forEach((it,i)=>{
+    const d=document.createElement('div');d.className='thumb';
+    const img=document.createElement('img');
+    img.src=it.type==='mem'?it.url:`/sd/download?file=${encodeURIComponent(it.path)}`;
+    img.onclick=()=>{
+      if(it.type==='mem')showImg(it.url,'Photo',it.blob);
+      else window.open(`/sd/download?file=${encodeURIComponent(it.path)}`);
     };
+    const badge=document.createElement('div');badge.className='badge';
+    badge.textContent=it.isVideo?'🎬':'📷';
+    d.appendChild(img);d.appendChild(badge);
+    $('thumbs').prepend(d);
   });
+}
 
-  // Terminal (SSE)
-  function termAppend(line){
-    const div = document.createElement('div');
-    div.textContent = line;
-    
-    // Highlight recording events
-    if (line.includes('[rec]') || line.includes('[btn]')) {
-      div.style.color = '#4CAF50';
+function addMem(blob){
+  const url=URL.createObjectURL(blob);
+  memGal.push({type:'mem',url,blob,size:blob.size});
+  if(tab==='mem')updateGal();
+}
+
+async function capture(){
+  setStatus('Capturing...');setOverlay('Capturing');
+  $('previewWrap').classList.remove('idle');
+  $('placeholder').style.display='flex';
+  $('placeholder').textContent='Capturing...';
+  $('previewImg').style.display='none';
+  try{
+    const r=await fetch('/capture?t='+Date.now(),{cache:'no-store'});
+    if(!r.ok)throw 0;
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    showImg(url,'Photo',blob);
+    setStatus('Captured');
+    addMem(blob);
+  }catch(e){
+    showIdle('Capture failed');
+    setStatus('Error');
+  }
+}
+
+function startStream(){
+  setStatus('Streaming...');
+  streaming=true;
+  $('startBtn').disabled=true;
+  $('stopBtn').disabled=false;
+  $('dlBtn').style.display='none';
+  $('fpsDisplay').style.display='block';
+  frameCount=0;lastFpsTime=Date.now();
+  
+  const img=$('previewImg');
+  img.onload=()=>{
+    frameCount++;
+    const now=Date.now();
+    if(now-lastFpsTime>=1000){
+      const fps=frameCount*1000/(now-lastFpsTime);
+      $('fpsDisplay').textContent=fps.toFixed(1)+' fps';
+      frameCount=0;lastFpsTime=now;
     }
-    
-    termBox.appendChild(div);
-    while (termBox.childNodes.length > 1200) termBox.removeChild(termBox.firstChild);
-    termBox.scrollTop = termBox.scrollHeight;
+  };
+  showImg('/stream?'+Date.now(),'Live');
+}
+
+function stopStream(){
+  streaming=false;
+  $('startBtn').disabled=false;
+  $('stopBtn').disabled=true;
+  $('previewImg').onload=null;
+  $('previewImg').src='';
+  setTimeout(()=>showIdle('Stopped'),100);
+  setStatus('Stopped');
+}
+
+async function flash(on){
+  setStatus(on?'Flash on':'Flash off');
+  try{await fetch('/flash?on='+(on?'1':'0'))}catch{}
+}
+
+function clearGal(){
+  if(tab==='mem'){memGal.forEach(x=>URL.revokeObjectURL(x.url));memGal=[];}
+  updateGal();setStatus('Cleared');
+}
+
+async function loadSD(){
+  try{
+    const r=await fetch('/sd/status');
+    const d=await r.json();
+    if(d.available){
+      $('sdPill').textContent='OK';
+      $('sdStatus').textContent=`${d.used_mb}/${d.total_mb}MB`;
+      $('sdBar').style.width=(d.used_mb/d.total_mb*100)+'%';
+      if(d.recording){$('recPill').style.display='inline-block';}
+      else{$('recPill').style.display='none';}
+    }else{
+      $('sdPill').textContent='No Card';$('sdStatus').textContent='Not available';
+    }
+  }catch{$('sdPill').textContent='Error';}
+  
+  try{
+    const r=await fetch('/sd/list');
+    const d=await r.json();
+    sdGal=(d.files||[]).map(f=>({type:'sd',name:f.name,path:f.path,size:f.size,isVideo:f.type==='video'}));
+    $('sdFiles').innerHTML='';
+    sdGal.slice().reverse().forEach(f=>{
+      const div=document.createElement('div');div.className='sdFile';
+      div.innerHTML=`<span>${f.isVideo?'🎬':'📷'}</span><span class="name">${f.name}</span><button onclick="window.open('/sd/download?file=${encodeURIComponent(f.path)}')">⬇</button>`;
+      $('sdFiles').appendChild(div);
+    });
+    if(tab==='sd')updateGal();
+  }catch{}
+}
+
+$('dlBtn').onclick=()=>{
+  if(curBlob){
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(curBlob);
+    a.download='capture_'+Date.now()+'.jpg';
+    a.click();
   }
+};
 
-  let es;
-  function connectTerminal(){
-    termStatus.textContent = "Connecting…";
-    es = new EventSource('/events');
-    es.onopen = () => termStatus.textContent = "Live";
-    es.onerror = () => termStatus.textContent = "Disconnected";
-    es.onmessage = (ev) => {
-      if (ev.data && ev.data !== "keepalive") termAppend(ev.data);
-    };
-  }
-  connectTerminal();
-
-  termClearBtn.onclick = async () => {
-    termBox.innerHTML = "";
-    try { await fetch('/log/clear', { cache:'no-store' }); } catch {}
+document.querySelectorAll('.tab').forEach(t=>{
+  t.onclick=()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    tab=t.dataset.tab;
+    updateGal();
   };
+});
 
-  // Bind UI
-  photoModeBtn.onclick = () => setMode("photo");
-  videoModeBtn.onclick = () => setMode("video");
-
-  captureBtn.onclick = capturePhoto;
-  startVideoBtn.onclick = startStream;
-  stopVideoBtn.onclick = stopStream;
-
-  flashOnBtn.onclick = () => flash(true);
-  flashOffBtn.onclick = () => flash(false);
-
-  clearGalleryBtn.onclick = clearGallery;
-  refreshGalleryBtn.onclick = () => {
-    loadSDStatus();
-    loadSDFiles();
-    setStatus("Gallery refreshed");
+// SSE Terminal
+let es;
+function connectTerm(){
+  $('termPill').textContent='Connecting...';
+  es=new EventSource('/events');
+  es.onopen=()=>$('termPill').textContent='Live';
+  es.onerror=()=>$('termPill').textContent='Offline';
+  es.onmessage=e=>{
+    if(e.data){
+      const d=document.createElement('div');
+      d.textContent=e.data;
+      if(e.data.includes('[stream]'))d.style.color='#8f8';
+      if(e.data.includes('[rec]')||e.data.includes('[btn]'))d.style.color='#ff8';
+      $('termBox').appendChild(d);
+      while($('termBox').childNodes.length>500)$('termBox').removeChild($('termBox').firstChild);
+      $('termBox').scrollTop=$('termBox').scrollHeight;
+    }
   };
-  sdRefreshBtn.onclick = () => {
-    loadSDStatus();
-    loadSDFiles();
-  };
+}
+connectTerm();
 
-  window.addEventListener("beforeunload", () => { try { clearGallery(); } catch {} });
+$('termClear').onclick=async()=>{$('termBox').innerHTML='';try{await fetch('/log/clear')}catch{}};
+$('photoBtn').onclick=()=>setMode('photo');
+$('videoBtn').onclick=()=>setMode('video');
+$('captureBtn').onclick=capture;
+$('startBtn').onclick=startStream;
+$('stopBtn').onclick=stopStream;
+$('flashOn').onclick=()=>flash(true);
+$('flashOff').onclick=()=>flash(false);
+$('clearBtn').onclick=clearGal;
+$('refreshBtn').onclick=loadSD;
+$('sdRefresh').onclick=loadSD;
 
-  // Initial load
-  updateGalleryUI();
-  setMode("photo");
-  loadSDStatus();
-  loadSDFiles();
-
-  // Periodic SD status refresh (every 3s)
-  setInterval(() => {
-    loadSDStatus();
-  }, 3000);
+setMode('photo');
+updateGal();
+loadSD();
+setInterval(loadSD,5000);
 </script>
 </body>
 </html>
@@ -1673,120 +1327,87 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-// ============================ WEBSERVER START ============================
+// ============================ WEBSERVER ============================
 static void start_webserver() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  config.max_uri_handlers = 12;  // Increased for new endpoints
+  config.max_uri_handlers = 12;
+  config.stack_size = 8192;  // Increase stack for streaming
 
   if (httpd_start(&g_httpd, &config) != ESP_OK) {
     log_pushf("[http] start failed");
     return;
   }
 
-  // Original endpoints
-  httpd_uri_t uri_index     = { .uri="/",          .method=HTTP_GET, .handler=index_handler,     .user_ctx=nullptr };
-  httpd_uri_t uri_capture   = { .uri="/capture",   .method=HTTP_GET, .handler=capture_handler,   .user_ctx=nullptr };
-  httpd_uri_t uri_stream    = { .uri="/stream",    .method=HTTP_GET, .handler=stream_handler,    .user_ctx=nullptr };
-  httpd_uri_t uri_flash     = { .uri="/flash",     .method=HTTP_GET, .handler=flash_handler,     .user_ctx=nullptr };
-  httpd_uri_t uri_events    = { .uri="/events",    .method=HTTP_GET, .handler=events_handler,    .user_ctx=nullptr };
-  httpd_uri_t uri_log_clear = { .uri="/log/clear", .method=HTTP_GET, .handler=log_clear_handler, .user_ctx=nullptr };
+  httpd_uri_t uris[] = {
+    {"/",           HTTP_GET, index_handler,       NULL},
+    {"/capture",    HTTP_GET, capture_handler,     NULL},
+    {"/stream",     HTTP_GET, stream_handler,      NULL},
+    {"/flash",      HTTP_GET, flash_handler,       NULL},
+    {"/events",     HTTP_GET, events_handler,      NULL},
+    {"/log/clear",  HTTP_GET, log_clear_handler,   NULL},
+    {"/sd/status",  HTTP_GET, sd_status_handler,   NULL},
+    {"/sd/list",    HTTP_GET, sd_list_handler,     NULL},
+    {"/sd/download",HTTP_GET, sd_download_handler, NULL},
+    {"/sd/delete",  HTTP_GET, sd_delete_handler,   NULL},
+  };
+
+  for (auto& u : uris) httpd_register_uri_handler(g_httpd, &u);
   
-  // New SD card endpoints
-  httpd_uri_t uri_sd_status   = { .uri="/sd/status",   .method=HTTP_GET, .handler=sd_status_handler,   .user_ctx=nullptr };
-  httpd_uri_t uri_sd_list     = { .uri="/sd/list",     .method=HTTP_GET, .handler=sd_list_handler,     .user_ctx=nullptr };
-  httpd_uri_t uri_sd_download = { .uri="/sd/download", .method=HTTP_GET, .handler=sd_download_handler, .user_ctx=nullptr };
-  httpd_uri_t uri_sd_delete   = { .uri="/sd/delete",   .method=HTTP_GET, .handler=sd_delete_handler,   .user_ctx=nullptr };
-
-  httpd_register_uri_handler(g_httpd, &uri_index);
-  httpd_register_uri_handler(g_httpd, &uri_capture);
-  httpd_register_uri_handler(g_httpd, &uri_stream);
-  httpd_register_uri_handler(g_httpd, &uri_flash);
-  httpd_register_uri_handler(g_httpd, &uri_events);
-  httpd_register_uri_handler(g_httpd, &uri_log_clear);
-  httpd_register_uri_handler(g_httpd, &uri_sd_status);
-  httpd_register_uri_handler(g_httpd, &uri_sd_list);
-  httpd_register_uri_handler(g_httpd, &uri_sd_download);
-  httpd_register_uri_handler(g_httpd, &uri_sd_delete);
-
-  log_pushf("[http] server started with SD endpoints");
+  log_pushf("[http] server ready");
 }
 
-// ============================ SETUP / LOOP ============================
+// ============================ SETUP ============================
 void setup() {
   Serial.begin(115200);
-  delay(250);
+  delay(200);
 
   pinMode(FLASH_LED_PIN, OUTPUT);
   set_flash(false);
-
-  // Setup button with internal pull-up
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   g_boot_ms = millis();
   log_clear();
 
-  log_pushf("%s boot…", DEVICE_NAME);
-  log_pushf("[sys] reset=%s", reset_reason_str(esp_reset_reason()));
-  log_pushf("[sys] cpu=%u MHz", (unsigned)getCpuFrequencyMhz());
-  log_pushf("[sys] heap=%u min_heap=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
-  log_pushf("[sys] psram=%s", psramFound() ? "FOUND" : "NOT FOUND");
-  if (psramFound()) log_pushf("[sys] psram_free=%u", (unsigned)ESP.getFreePsram());
+  log_pushf("=== %s ===", DEVICE_NAME);
+  log_pushf("[sys] reset=%s cpu=%uMHz", reset_reason_str(esp_reset_reason()), getCpuFrequencyMhz());
+  log_pushf("[sys] heap=%u psram=%s", ESP.getFreeHeap(), psramFound() ? "YES" : "NO");
 
-  // Initialize SD card before camera (they share some pins in 4-bit mode)
-  log_pushf("[sd] initializing...");
+  log_pushf("[sd] init...");
   g_sd_available = init_sd_card();
-  if (!g_sd_available) {
-    log_pushf("[sd] WARNING: SD card not available - button captures will fail");
-  }
 
   setup_camera();
 
-  // Attach button interrupt
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), button_isr, CHANGE);
-  log_pushf("[btn] button on GPIO%d ready", BUTTON_PIN);
+  log_pushf("[btn] GPIO%d ready", BUTTON_PIN);
 
   WiFi.onEvent(onWiFiEvent);
-  bool ok = connect_wifi_dual();
-  if (!ok) {
-    log_pushf("[wifi] continuing without Wi-Fi (UI unreachable)");
-  } else {
-    log_pushf("[wifi] connected ok");
-  }
+  connect_wifi_dual();
 
   start_webserver();
 
   if (WiFi.status() == WL_CONNECTED) {
-    log_pushf("[open] http://%s/", WiFi.localIP().toString().c_str());
+    log_pushf("[url] http://%s/", WiFi.localIP().toString().c_str());
   }
 
-  log_pushf("[ready] Single click=Photo, Long press=Video");
+  log_pushf("[ready] Click=Photo, Hold=Video");
 }
 
+// ============================ LOOP ============================
 void loop() {
-  const uint32_t now = millis();
-
-  // Process button events
   process_button_events();
 
-  // Heartbeat
+  uint32_t now = millis();
   if (now - g_last_status_ms > 5000) {
     g_last_status_ms = now;
-
-    const bool wifi_ok = (WiFi.status() == WL_CONNECTED);
-    const int rssi = wifi_ok ? WiFi.RSSI() : 0;
-    const uint32_t up_s = (now - g_boot_ms) / 1000;
-
-    log_pushf("[status] up=%us wifi=%s rssi=%d heap=%u psram=%u sd=%s%s",
-              (unsigned)up_s,
-              wifi_ok ? "OK" : "DOWN",
-              rssi,
-              (unsigned)ESP.getFreeHeap(),
-              psramFound() ? (unsigned)ESP.getFreePsram() : 0u,
+    log_pushf("[stat] up=%us wifi=%s rssi=%d heap=%u sd=%s%s",
+              (now - g_boot_ms) / 1000,
+              WiFi.status() == WL_CONNECTED ? "OK" : "DOWN",
+              WiFi.RSSI(),
+              ESP.getFreeHeap(),
               g_sd_available ? "OK" : "NO",
               g_is_recording ? " REC" : "");
   }
 
-  // Small delay, but keep responsive for recording
-  delay(g_is_recording ? 10 : 50);
+  delay(g_is_recording ? 5 : 20);
 }
