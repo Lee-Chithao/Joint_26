@@ -1,25 +1,32 @@
 /**
- * Joint_CM_2026 v2.2 — ESP32-CAM with Web-Based Eye Tracking
- * 
- * NEW IN THIS VERSION:
+ * Joint_CM_2026 v2.3 — ESP32-CAM with Web-Based Eye Tracking
+ *
+ * NEW IN v2.3:
+ * - WiFi Auto-reconnect: Automatically reconnects if WiFi connection drops
+ *   - Checks connection every 10 seconds
+ *   - Attempts reconnection with 30-second intervals between retries
+ *   - Supports both PSK and Enterprise WiFi with automatic fallback
+ *   - Logs reconnection attempts and success in terminal
+ *
+ * FEATURES FROM v2.2:
  * - Web-based eye tracking using TensorFlow.js Face Landmarks Detection
  * - Laptop webcam detects when user is looking at the camera
- * - 50% random chance to auto-capture when gaze is detected
+ * - Configurable capture probability when gaze is detected
  * - Captures stored in /eyetrack/ folder on SD card
  * - Round eye-tracking visualization window in Web UI
  * - Real-time eye position and direction display
- * 
+ *
  * ARCHITECTURE:
  * 1. Laptop webcam → TensorFlow.js face-landmarks-detection model
  * 2. Browser calculates gaze direction from iris landmarks
  * 3. When "looking at camera" detected → random check → trigger ESP32 capture
  * 4. ESP32 receives /eyetrack/capture request → saves to SD card
- * 
- * ALL PREVIOUS FEATURES RETAINED:
+ *
+ * ALL CORE FEATURES:
  * - Physical button: click=photo, hold=video
  * - SD card storage for button captures
  * - Web UI with download capability
- * - Dual WiFi (Enterprise + PSK)
+ * - Dual WiFi (Enterprise + PSK) with auto-reconnect
  * - SSE terminal with logs
  * - Performance optimizations
  */
@@ -55,7 +62,7 @@ static const char* WIFI_ENT_USER  = "21005976";
 static const char* WIFI_ENT_PASS  = "#35L79Z57vb";
 static const char* WIFI_ENT_IDENT = "";
 
-static const char* DEVICE_NAME = "Joint_CM_2026 v2.2 EyeTrack";
+static const char* DEVICE_NAME = "Joint_CM_2026 v2.3 EyeTrack+AutoReconnect";
 
 // Hardware pins
 static const int FLASH_LED_PIN = 4;
@@ -119,6 +126,12 @@ static volatile uint32_t g_recording_start_ms = 0;
 static char g_current_video_path[64] = {0};
 static File g_video_file;
 static uint32_t g_video_frame_count = 0;
+
+// ============================ WIFI RECONNECT STATE ============================
+static uint32_t g_last_wifi_check_ms = 0;
+static uint32_t g_wifi_reconnect_attempts = 0;
+static const uint32_t WIFI_CHECK_INTERVAL_MS = 10000; // Check every 10 seconds
+static const uint32_t WIFI_RECONNECT_DELAY_MS = 30000; // Wait 30s between reconnect attempts
 
 // ============================ SD CARD STATE ============================
 static bool g_sd_available = false;
@@ -536,16 +549,63 @@ static bool connect_wifi_enterprise() {
 
 static void connect_wifi_dual() {
   WiFi.mode(WIFI_STA);
-  
+
   if (connect_wifi_psk()) return;
   log_pushf("[wifi] PSK failed, trying Enterprise...");
-  
+
   WiFi.disconnect(true);
   delay(100);
-  
+
   if (connect_wifi_enterprise()) return;
   log_pushf("[wifi] Enterprise failed");
   log_pushf("[wifi] continuing offline");
+}
+
+// ============================ WIFI AUTO-RECONNECT ============================
+
+static void check_and_reconnect_wifi() {
+  uint32_t now = millis();
+
+  // Only check at specified intervals
+  if (now - g_last_wifi_check_ms < WIFI_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  g_last_wifi_check_ms = now;
+
+  // If WiFi is connected, reset reconnect attempts counter
+  if (WiFi.status() == WL_CONNECTED) {
+    if (g_wifi_reconnect_attempts > 0) {
+      log_pushf("[wifi] reconnect successful after %u attempts", g_wifi_reconnect_attempts);
+      g_wifi_reconnect_attempts = 0;
+    }
+    return;
+  }
+
+  // WiFi is disconnected - attempt reconnection
+  // Add delay between attempts to avoid hammering the network
+  static uint32_t last_reconnect_attempt = 0;
+  if (now - last_reconnect_attempt < WIFI_RECONNECT_DELAY_MS) {
+    return;
+  }
+
+  last_reconnect_attempt = now;
+  g_wifi_reconnect_attempts++;
+
+  log_pushf("[wifi] disconnected, attempting reconnect #%u", g_wifi_reconnect_attempts);
+
+  // Try to reconnect using the dual WiFi function
+  WiFi.disconnect(true);
+  delay(100);
+  connect_wifi_dual();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    log_pushf("[wifi] reconnected successfully");
+    g_wifi_reconnect_attempts = 0;
+  } else {
+    log_pushf("[wifi] reconnect attempt #%u failed, will retry in %us",
+              g_wifi_reconnect_attempts, WIFI_RECONNECT_DELAY_MS / 1000);
+  }
 }
 
 // ============================ HTTP HANDLERS ============================
@@ -959,7 +1019,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Joint_CM_2026 v2.2 - Eye Tracking</title>
+<title>Joint_CM_2026 v2.3 - Eye Tracking + Auto-Reconnect</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a0f;color:#e0e0e0;min-height:100vh;padding:15px}
@@ -1044,7 +1104,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a0f;color:#e0e0e
 <body>
 <div class="header">
 <h1>Joint_CM_2026</h1>
-<div class="ver">v2.2 Eye Tracking Edition</div>
+<div class="ver">v2.3 Eye Tracking + WiFi Auto-Reconnect</div>
 </div>
 <div class="main-grid">
 <div class="left-col">
@@ -1387,6 +1447,9 @@ void setup() {
 // ============================ LOOP ============================
 void loop() {
   process_button_events();
+
+  // Auto-reconnect WiFi if connection is lost
+  check_and_reconnect_wifi();
 
   uint32_t now = millis();
   if (now - g_last_status_ms > 5000) {
